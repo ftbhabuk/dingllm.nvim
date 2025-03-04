@@ -12,7 +12,6 @@ function M.get_lines_until_cursor()
   local row = cursor_position[1]
 
   local lines = vim.api.nvim_buf_get_lines(current_buffer, 0, row, true)
-
   return table.concat(lines, '\n')
 end
 
@@ -61,7 +60,11 @@ function M.make_anthropic_spec_curl_args(opts, prompt, system_prompt)
     stream = true,
     max_tokens = 4096,
   }
-  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', vim.json.encode(data) }
+  local temp_file = os.tmpname()
+  local f = io.open(temp_file, "w")
+  f:write(vim.json.encode(data))
+  f:close()
+  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', '@' .. temp_file }
   if api_key then
     table.insert(args, '-H')
     table.insert(args, 'x-api-key: ' .. api_key)
@@ -69,7 +72,7 @@ function M.make_anthropic_spec_curl_args(opts, prompt, system_prompt)
     table.insert(args, 'anthropic-version: 2023-06-01')
   end
   table.insert(args, url)
-  return args
+  return args, temp_file
 end
 
 function M.make_openai_spec_curl_args(opts, prompt, system_prompt)
@@ -81,13 +84,17 @@ function M.make_openai_spec_curl_args(opts, prompt, system_prompt)
     temperature = 0.7,
     stream = true,
   }
-  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', vim.json.encode(data) }
+  local temp_file = os.tmpname()
+  local f = io.open(temp_file, "w")
+  f:write(vim.json.encode(data))
+  f:close()
+  local args = { '-N', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', '@' .. temp_file }
   if api_key then
     table.insert(args, '-H')
     table.insert(args, 'Authorization: Bearer ' .. api_key)
   end
   table.insert(args, url)
-  return args
+  return args, temp_file
 end
 
 function M.write_string_at_cursor(str)
@@ -98,7 +105,7 @@ function M.write_string_at_cursor(str)
 
     local lines = vim.split(str, '\n')
 
-    vim.cmd("undojoin")
+    pcall(vim.cmd, "undojoin")
     vim.api.nvim_put(lines, 'c', true, true)
 
     local num_lines = #lines
@@ -107,7 +114,7 @@ function M.write_string_at_cursor(str)
   end)
 end
 
-local function get_prompt(opts)
+function M.get_prompt(opts)
   local replace = opts.replace
   local visual_lines = M.get_visual_selection()
   local prompt = ''
@@ -124,6 +131,11 @@ local function get_prompt(opts)
     prompt = M.get_lines_until_cursor()
   end
 
+  print("Prompt length: " .. #prompt .. " chars")
+  if #prompt > 10000 then
+    print("Warning: Prompt exceeds 10k chars, trimming to first 10k")
+    prompt = string.sub(prompt, 1, 10000)
+  end
   return prompt
 end
 
@@ -155,9 +167,10 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
   vim.api.nvim_clear_autocmds { group = group }
   local prompt = get_prompt(opts)
   local system_prompt = opts.system_prompt or 'You are a tsundere uwu anime. Yell at me for not setting my configuration for my llm plugin correctly'
-  local args = make_curl_args_fn(opts, prompt, system_prompt)
+  local args, temp_file = make_curl_args_fn(opts, prompt, system_prompt)
   local curr_event_state = nil
 
+  print("Curl command: curl " .. table.concat(args, " "))
   local function parse_and_call(line)
     local event = line:match '^event: (.+)$'
     if event then
@@ -181,13 +194,21 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
     on_stdout = function(_, out)
       parse_and_call(out)
     end,
-    on_stderr = function(_, _) end,
+    on_stderr = function(_, err)
+      print("curl stderr: " .. err)
+    end,
     on_exit = function()
+      print("Job finished")
       active_job = nil
+      if temp_file then
+        os.remove(temp_file)
+        print("Cleaned up temp file: " .. temp_file)
+      end
     end,
   }
 
   active_job:start()
+  print("Job started with PID: " .. (active_job.pid or "unknown"))
 
   vim.api.nvim_create_autocmd('User', {
     group = group,
